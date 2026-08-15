@@ -635,6 +635,12 @@ inline __m128i _mm_cmpgt_epu16(__m128i a, __m128i b)
     return _mm_cmpgt_epi16(_mm_xor_si128(a, c), _mm_xor_si128(b, c));
 }
 
+inline __m128i _mm_cmpgt_epu32(__m128i a, __m128i b)
+{
+    __m128i c = _mm_set1_epi32(int(0x80000000));
+    return _mm_cmpgt_epi32(_mm_xor_si128(a, c), _mm_xor_si128(b, c));
+}
+
 inline __m128i _mm_vctsxs(__m128 src1)
 {
     __m128 xmm2 = _mm_cmpunord_ps(src1, src1);

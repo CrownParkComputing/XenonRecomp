@@ -2095,6 +2095,15 @@ bool Recompiler::Recompile(
             println("\t{}.setFromMask(_mm_load_si128((__m128i*){}.u16), 0xFFFF);", cr(6), v(insn.operands[0]));
         break;
 
+    // UNSIGNED word compare. The signed VCMPGTSW below cannot stand in: with
+    // the top bit set the two disagree on every such word, and the result here
+    // feeds a mask rather than a value, so a wrong lane is silent.
+    case PPC_INST_VCMPGTUW:
+        println("\t_mm_store_si128((__m128i*){}.u8, _mm_cmpgt_epu32(_mm_load_si128((__m128i*){}.u32), _mm_load_si128((__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.setFromMask(_mm_load_si128((__m128i*){}.u32), 0xFFFF);", cr(6), v(insn.operands[0]));
+        break;
+
     case PPC_INST_VCMPGTSH:
         println("\t_mm_store_si128((__m128i*){}.s8, _mm_cmpgt_epi16(_mm_load_si128((__m128i*){}.u16), _mm_load_si128((__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         if (strchr(insn.opcode->name, '.'))
@@ -2146,6 +2155,18 @@ bool Recompiler::Recompile(
 
     case PPC_INST_VMINSH:
         println("\t_mm_store_si128((__m128i*){}.u16, _mm_min_epi16(_mm_load_si128((__m128i*){}.u16), _mm_load_si128((__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VMINSW:
+        println("\t_mm_store_si128((__m128i*){}.u32, _mm_min_epi32(_mm_load_si128((__m128i*){}.u32), _mm_load_si128((__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    // UNSIGNED word minimum. Distinct from VMINSW rather than a spelling of
+    // it: 0xFFFFFFFF is the largest value here and the smallest there, so
+    // reusing _mm_min_epi32 would return the wrong operand for any word with
+    // the top bit set.
+    case PPC_INST_VMINUW:
+        println("\t_mm_store_si128((__m128i*){}.u32, _mm_min_epu32(_mm_load_si128((__m128i*){}.u32), _mm_load_si128((__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
     case PPC_INST_VMINFP:
@@ -2304,6 +2325,35 @@ bool Recompiler::Recompile(
         {
             println("\t{0}.u8[{1}] = {2}.u16[{1}] > UCHAR_MAX ? UCHAR_MAX : {2}.u16[{1}];", vTemp(), i, v(insn.operands[2]));
             println("\t{0}.u8[{1}] = {2}.u16[{3}] > UCHAR_MAX ? UCHAR_MAX : {2}.u16[{3}];", vTemp(), i + 8, v(insn.operands[1]), i);
+        }
+        println("{} = {};", v(insn.operands[0]), vTemp());
+        break;
+
+    // Word -> halfword with UNSIGNED source saturation, so 0xFFFFFFFF becomes
+    // 0xFFFF. _mm_packus_epi32 cannot be used for it: that reads its input as
+    // signed and would clamp the same word to 0. Written out element by
+    // element exactly as VPKUHUS is, one size up.
+    case PPC_INST_VPKUWUS:
+    case PPC_INST_VPKUWUS128:
+        for (size_t i = 0; i < 4; i++)
+        {
+            println("\t{0}.u16[{1}] = {2}.u32[{1}] > USHRT_MAX ? USHRT_MAX : {2}.u32[{1}];", vTemp(), i, v(insn.operands[2]));
+            println("\t{0}.u16[{1}] = {2}.u32[{3}] > USHRT_MAX ? USHRT_MAX : {2}.u32[{3}];", vTemp(), i + 4, v(insn.operands[1]), i);
+        }
+        println("{} = {};", v(insn.operands[0]), vTemp());
+        break;
+
+    // Halfword -> byte MODULO, which truncates rather than saturating: 0x01FF
+    // becomes 0xFF, where VPKUHUS would also give 0xFF but 0x0100 becomes 0x00
+    // here and 0xFF there. Element by element in the same operand order as
+    // VPKUHUS - vB fills the low half, vA the high - with the clamp removed
+    // rather than replaced, because the truncation IS the instruction.
+    case PPC_INST_VPKUHUM:
+    case PPC_INST_VPKUHUM128:
+        for (size_t i = 0; i < 8; i++)
+        {
+            println("\t{0}.u8[{1}] = uint8_t({2}.u16[{1}]);", vTemp(), i, v(insn.operands[2]));
+            println("\t{0}.u8[{1}] = uint8_t({2}.u16[{3}]);", vTemp(), i + 8, v(insn.operands[1]), i);
         }
         println("{} = {};", v(insn.operands[0]), vTemp());
         break;
