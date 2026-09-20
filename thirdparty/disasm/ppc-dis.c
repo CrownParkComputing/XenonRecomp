@@ -5336,6 +5336,17 @@ powerpc_dialect(struct disassemble_info* info)
         && strstr(info->disassembler_options, "440") != NULL)
         dialect |= PPC_OPCODE_BOOKE | PPC_OPCODE_32
         | PPC_OPCODE_440 | PPC_OPCODE_ISEL | PPC_OPCODE_RFMCI;
+    else if (info->disassembler_options
+        && strstr(info->disassembler_options, "cell") != NULL)
+        /* Xenon uses the VMX128 instruction space added to the Cell dialect,
+           but not the embedded PPC403 multiply-accumulate instructions.  The
+           latter overlap legal VMX128 encodings and, when both are enabled,
+           win by table order (for example vsldoi128 is decoded as maclhwu).
+           Keep the ordinary/classic instruction families from the default
+           dialect while deliberately leaving PPC_OPCODE_403 out.  */
+        dialect |= (PPC_OPCODE_601 | PPC_OPCODE_CLASSIC | PPC_OPCODE_COMMON
+            | PPC_OPCODE_POWER4 | PPC_OPCODE_CELL | PPC_OPCODE_ALTIVEC
+            | PPC_OPCODE_VMX_128);
     else
         dialect |= (PPC_OPCODE_403 | PPC_OPCODE_601 | PPC_OPCODE_CLASSIC
             | PPC_OPCODE_COMMON | PPC_OPCODE_ALTIVEC);
@@ -5347,10 +5358,6 @@ powerpc_dialect(struct disassemble_info* info)
     if (info->disassembler_options
         && strstr(info->disassembler_options, "power5") != NULL)
         dialect |= PPC_OPCODE_POWER4 | PPC_OPCODE_POWER5;
-
-    if (info->disassembler_options
-        && strstr(info->disassembler_options, "cell") != NULL)
-        dialect |= PPC_OPCODE_POWER4 | PPC_OPCODE_CELL | PPC_OPCODE_ALTIVEC | PPC_OPCODE_VMX_128;
 
     if (info->disassembler_options
         && strstr(info->disassembler_options, "power6") != NULL)

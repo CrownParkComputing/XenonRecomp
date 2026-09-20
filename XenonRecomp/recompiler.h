@@ -62,6 +62,11 @@ struct Recompiler
         RecompilerLocalVariables& localVariables,
         CSRState& csrState);
 
+    // Is this function's last instruction a call to a routine that never
+    // comes back? Diagnostic only - it decides whether "runs off its end" is
+    // reported, and never what is emitted.
+    bool EndsInCallThatNeverReturns(const ppc_insn& insn) const;
+
     bool Recompile(const Function& fn);
 
     void Recompile(const std::filesystem::path& headerFilePath);

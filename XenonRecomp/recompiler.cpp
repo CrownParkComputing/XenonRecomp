@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "pch.h"
 #include "recompiler.h"
 #include <xex_patcher.h>
@@ -183,6 +184,22 @@ void Recompiler::Analyse()
         fn.BeginAddress = ByteSwap(fn.BeginAddress);
         fn.Data = ByteSwap(fn.Data);
 
+        // A .pdata table is sized to its section, not to its contents, so the
+        // tail of it is zero padding. Rainbow Islands Towering Adventure has
+        // 18,531 slots of which the last 1,707 are zeroes.
+        //
+        // Read literally, each of those is a function at address 0 of length 0,
+        // and both halves of that do damage. The address puts 1,707 identical
+        // `{ 0x0, sub_0 }` rows at the head of ppc_func_mapping.cpp, which the
+        // runtime's function table cannot resolve. The length leaves the decode
+        // loop in Recompile() with zero iterations, so the "runs off its end"
+        // check that follows it reads an ppc_insn that was never written.
+        //
+        // Neither is specific to this title: no image has a function at address
+        // zero, and no function is zero instructions long.
+        if (fn.BeginAddress == 0 || fn.FunctionLength == 0)
+            continue;
+
         if (image.symbols.find(fn.BeginAddress) == image.symbols.end())
         {
             auto& f = functions.emplace_back();
@@ -251,7 +268,23 @@ void Recompiler::Analyse()
         }
     }
 
-    std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
+    std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs)
+        {
+            if (lhs.base != rhs.base)
+                return lhs.base < rhs.base;
+            // Largest first, so the de-duplication below keeps it.
+            return lhs.size > rhs.size;
+        });
+
+    // Functions are discovered by four independent passes - the config, the
+    // .pdata table, a scan for `bl` targets and a linear walk - and nothing
+    // stops two of them landing on the same address. When that happens the
+    // same function is emitted twice and the output does not link. Keeping the
+    // largest span is the right choice: a longer analysis is the one that saw
+    // more of the function before it stopped.
+    functions.erase(std::unique(functions.begin(), functions.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.base == rhs.base; }),
+        functions.end());
 }
 
 bool Recompiler::Recompile(
@@ -417,6 +450,30 @@ bool Recompiler::Recompile(
             else
             {
                 println("\tif ({}{}.{}) goto loc_{:X};", not_ ? "!" : "", cr(insn.operands[0]), cond, insn.operands[1]);
+            }
+        };
+
+    // The CTR-decrement branch family (bdz/bdnz and their condition-tested
+    // forms) can target another function exactly like the plain conditional
+    // branches above - compilers fold shared loop tails that way, so the target
+    // lands past this function's end. Those cases used to emit a bare
+    // `goto loc_X` for such a target, naming a label that is never emitted, and
+    // the translation unit then failed to compile with "use of undeclared
+    // label". Mirror printConditionalBranch: tail-call when the target is
+    // outside this function, goto when it is inside.
+    auto printCtrBranch = [&](const std::string& cond, uint32_t target)
+        {
+            if (target < fn.base || target >= fn.base + fn.size)
+            {
+                println("\tif ({}) {{", cond);
+                print("\t");
+                printFunctionCall(target);
+                println("\t\treturn;");
+                println("\t}}");
+            }
+            else
+            {
+                println("\tif ({}) goto loc_{:X};", cond, target);
             }
         };
 
@@ -624,7 +681,18 @@ bool Recompiler::Recompile(
     case PPC_INST_BCTR:
         if (switchTable != config.switchTables.end())
         {
-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
+            // The index is the LOW 32 BITS of the register, not the whole 64.
+            // A PPC switch scales its index with `rlwinm rT,rIDX,2,0,29`, which
+            // reads the low word and zero-extends - so the hardware indexes the
+            // table with the low 32 bits however dirty the high half is. And the
+            // high half is often dirty: `addi rIDX,rIDX,N` on a value like
+            // 0xFFFFFFEE carries into bit 32, leaving 0x1_00000001. The bounds
+            // check ahead of the dispatch is a `cmplwi`, so it compares the low
+            // word and passes. Switching on .u64 then matches no case at all,
+            // and the default is `__builtin_unreachable()` - a wild jump.
+            // Space Giraffe crashed on exactly this at 0x82151348 with the
+            // index register holding 0x100000001.
+            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
 
             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
             {
@@ -632,8 +700,13 @@ bool Recompiler::Recompile(
                 auto label = switchTable->second.labels[i];
                 if (label < fn.base || label >= fn.base + fn.size)
                 {
-                    println("\t\t// ERROR: 0x{:X}", label);
-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
+                    // Some compiler-generated dispatchers share case bodies
+                    // with a neighboring entry point. A branch to an external
+                    // recompiled function followed by return has the same tail
+                    // semantics as the guest bctr, and also supports a case
+                    // body located before this function's nominal start.
+                    print("\t");
+                    printFunctionCall(label);
                     println("\t\treturn;");
                 }
                 else
@@ -664,14 +737,14 @@ bool Recompiler::Recompile(
 
     case PPC_INST_BDZ:
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
+        printCtrBranch(fmt::format("{}.u32 == 0", ctr()), insn.operands[0]);
         break;
 
     case PPC_INST_BDZF:
     {
         constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 == 0 && !{}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], insn.operands[1]);
+        printCtrBranch(fmt::format("{}.u32 == 0 && !{}.{}", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4]), insn.operands[1]);
         break;
     }
 
@@ -682,14 +755,14 @@ bool Recompiler::Recompile(
 
     case PPC_INST_BDNZ:
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
+        printCtrBranch(fmt::format("{}.u32 != 0", ctr()), insn.operands[0]);
         break;
 
     case PPC_INST_BDNZF:
     {
         constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 != 0 && !{}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], insn.operands[1]);
+        printCtrBranch(fmt::format("{}.u32 != 0 && !{}.{}", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4]), insn.operands[1]);
         break;
     }
 
@@ -697,7 +770,7 @@ bool Recompiler::Recompile(
     {
         constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 != 0 && {}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], insn.operands[1]);
+        printCtrBranch(fmt::format("{}.u32 != 0 && {}.{}", ctr(), cr(insn.operands[0] / 4), fields[insn.operands[0] % 4]), insn.operands[1]);
         break;
     }
 
@@ -758,6 +831,28 @@ bool Recompiler::Recompile(
 
     case PPC_INST_BNE:
         printConditionalBranch(true, "eq");
+        break;
+
+    case PPC_INST_BSO:
+        printConditionalBranch(false, "so");
+        break;
+
+    case PPC_INST_BNS:
+        printConditionalBranch(true, "so");
+        break;
+
+    case PPC_INST_BNSLR:
+        println("\tif (!{}.so) return;", cr(insn.operands[0]));
+        break;
+
+    // The mirror of BNSLR, and it was missing - so `bsolr` was reported as an
+    // unrecognized instruction and emitted as a bare comment, i.e. dropped.
+    // After a floating-point compare the field is the UNORDERED bit (PPCCRRegister
+    // unions `so` with `un`, and compare(double,double) writes `un`), so the pair
+    // `bltlr crN` / `bsolr crN` is the ordinary "return unless a >= b, NaN
+    // included" the MSVC PPC compiler emits. Ridge Racer 6 has 11 of them.
+    case PPC_INST_BSOLR:
+        println("\tif ({}.so) return;", cr(insn.operands[0]));
         break;
 
     case PPC_INST_BNECTR:
@@ -864,10 +959,13 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_DCBZ:
+        // Xenon's PPE has 128-byte cache lines. Guest memset implementations
+        // advance by 128 bytes per dcbz, so generic PPC's 32-byte model leaves
+        // three quarters of each line untouched (and breaks SCIV startup).
         print("\tmemset(base + ((");
         if (insn.operands[0] != 0)
             print("{}.u32 + ", r(insn.operands[0]));
-        println("{}.u32) & ~31), 0, 32);", r(insn.operands[1]));
+        println("{}.u32) & ~127), 0, 128);", r(insn.operands[1]));
         break;
 
     case PPC_INST_DCBZL:
@@ -962,6 +1060,18 @@ bool Recompiler::Recompile(
         println("\t{}.s64 = ({}.f64 > double(LLONG_MAX)) ? LLONG_MAX : _mm_cvttsd_si64(_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
         break;
 
+    // Convert to integer word using the CURRENT rounding mode, where FCTIWZ
+    // truncates - the only difference is cvtsd against cvttsd, and it is the
+    // whole difference between rounding 0.5 up and dropping it. Hydro Thunder
+    // Hurricane has two, at 0x827920A4 and 0x827920BC. NaN needs no special
+    // case: x86 returns the integer-indefinite value 0x80000000 for it, which is
+    // exactly what the PowerPC produces. The `> INT_MAX` guard is the one that
+    // matters, because there the PowerPC saturates and x86 does not.
+    case PPC_INST_FCTIW:
+        printSetFlushMode(false);
+        println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : _mm_cvtsd_si32(_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+        break;
+
     case PPC_INST_FCTIWZ:
         printSetFlushMode(false);
         println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : _mm_cvttsd_si32(_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
@@ -1040,6 +1150,21 @@ bool Recompiler::Recompile(
     case PPC_INST_FRES:
         printSetFlushMode(false);
         println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+        break;
+
+    // Reciprocal square root estimate. The architecture only promises a few
+    // bits of accuracy and callers refine it, so computing it exactly is both
+    // simpler and strictly closer to the ideal than the hardware estimate.
+    // Without this case the instruction is dropped as a comment: Geometry Wars
+    // 2 has 104 of them, all in vector-normalise paths.
+    case PPC_INST_FRSQRTE:
+        printSetFlushMode(false);
+        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+        break;
+
+    case PPC_INST_FRSQRTES:
+        printSetFlushMode(false);
+        println("\t{}.f64 = double(float(1.0 / sqrt({}.f64)));", f(insn.operands[0]), f(insn.operands[1]));
         break;
 
     case PPC_INST_FRSP:
@@ -1143,7 +1268,11 @@ bool Recompiler::Recompile(
     case PPC_INST_LFDU:
         printSetFlushMode(false);
         println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
-        println("\t{}.u64 = PPC_LOAD_U64({});", r(insn.operands[0]), ea());
+        // operand 0 names an FPR, so it must go through f() - r() writes the
+        // GENERAL-purpose register of the same number, which both loses the
+        // loaded double and destroys whatever that GPR held. LFD and LFDX above
+        // get this right; these update forms did not.
+        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
         println("\t{}.u32 = {};", r(insn.operands[2]), ea());
         break;
 
@@ -1158,7 +1287,8 @@ bool Recompiler::Recompile(
     case PPC_INST_LFDUX:
         printSetFlushMode(false);
         println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
-        println("\t{}.u64 = PPC_LOAD_U64({});", r(insn.operands[0]), ea());
+        // As LFDU: operand 0 is an FPR. See the note there.
+        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
         println("\t{}.u32 = {};", r(insn.operands[1]), ea());
         break;
 
@@ -1211,6 +1341,16 @@ bool Recompiler::Recompile(
 
     case PPC_INST_LHAX:
         print("\t{}.s64 = int16_t(PPC_LOAD_U16(", r(insn.operands[0]));
+        if (insn.operands[1] != 0)
+            print("{}.u32 + ", r(insn.operands[1]));
+        println("{}.u32));", r(insn.operands[2]));
+        break;
+
+    // Byte-reversed halfword load - the little-endian counterpart of lhzx,
+    // which a big-endian title uses to read little-endian data (here, one call
+    // site in Geometry Wars 2). Same operand form as lwbrx.
+    case PPC_INST_LHBRX:
+        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
         println("{}.u32));", r(insn.operands[2]));
@@ -1435,6 +1575,27 @@ bool Recompiler::Recompile(
             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
 
+    // The signed form of the same trick, for a signed divisor. The sign
+    // matters: a signed reciprocal multiply keeps the arithmetic high half,
+    // and computing the unsigned one instead is wrong for every negative
+    // input. Alien Breed: Evolution has one at 0x82237130.
+    case PPC_INST_MULHD:
+        println("\t{}.s64 = int64_t((__int128_t({}.s64) * __int128_t({}.s64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+        break;
+
+    // The 64-bit high half. This is how the compiler divides by a constant:
+    // multiply by a reciprocal magic number and keep the top bits, so dropping
+    // the instruction leaves the destination holding whatever it held before -
+    // a plausible number, not a crash. Space Giraffe has one, dividing a
+    // 64-bit tick count by 1000 (magic 0x0624DD2F1A9FBE77) at 0x820A81EC.
+    case PPC_INST_MULHDU:
+        println("\t{}.u64 = uint64_t((__uint128_t({}.u64) * __uint128_t({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+        break;
+
     case PPC_INST_MULLD:
         println("\t{}.s64 = {}.s64 * {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
         break;
@@ -1493,16 +1654,22 @@ bool Recompiler::Recompile(
 
     case PPC_INST_RLDICL:
         println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}) & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], ComputeMask(insn.operands[3], 63));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
 
     case PPC_INST_RLDICR:
         println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}) & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], ComputeMask(0, insn.operands[3]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
 
     case PPC_INST_RLDIMI:
     {
         const uint64_t mask = ComputeMask(insn.operands[3], ~insn.operands[2]);
         println("\t{}.u64 = (__builtin_rotateleft64({}.u64, {}) & 0x{:X}) | ({}.u64 & 0x{:X});", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], mask, r(insn.operands[0]), ~mask);
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
     }
 
@@ -1670,7 +1837,11 @@ bool Recompiler::Recompile(
     case PPC_INST_STFDU:
         printSetFlushMode(false);
         println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
-        println("\t{}{}, {}.u64);", mmioStore() ? "PPC_MM_STORE_U64(" : "PPC_STORE_U64(", ea(), r(insn.operands[0]));
+        // The mirror of the LFDU bug: operand 0 is the FPR being stored, so
+        // r() here writes the same-numbered GPR's bits to memory instead of the
+        // double. It does not corrupt a register, it silently stores the wrong
+        // VALUE - which is worse to find later.
+        println("\t{}{}, {}.u64);", mmioStore() ? "PPC_MM_STORE_U64(" : "PPC_STORE_U64(", ea(), f(insn.operands[0]));
         println("\t{}.u32 = {};", r(insn.operands[2]), ea());
         break;
 
@@ -1755,6 +1926,16 @@ bool Recompiler::Recompile(
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
         println("{}.u32, {}.u16);", r(insn.operands[2]), r(insn.operands[0]));
+        break;
+
+    case PPC_INST_STVEBX:
+        // The effective-address low nibble selects the guest vector byte. The
+        // runtime stores vectors fully reversed, so guest element 0 is u8[15].
+        print("\t{} = ", ea());
+        if (insn.operands[1] != 0)
+            print("{}.u32 + ", r(insn.operands[1]));
+        println("{}.u32;", r(insn.operands[2]));
+        println("\tPPC_STORE_U8({}, {}.u8[15 - ({} & 0xF)]);", ea(), v(insn.operands[0]), ea());
         break;
 
     case PPC_INST_STVEHX:
@@ -1961,6 +2142,7 @@ bool Recompiler::Recompile(
         println("\t_mm_store_si128((__m128i*){}.u8, _mm_and_si128(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
+    case PPC_INST_VANDC:
     case PPC_INST_VANDC128:
         println("\t_mm_store_si128((__m128i*){}.u8, _mm_andnot_si128(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
         break;
@@ -1971,6 +2153,13 @@ bool Recompiler::Recompile(
 
     case PPC_INST_VAVGSH:
         println("\t_mm_store_si128((__m128i*){}.u8, _mm_avg_epi16(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
+    case PPC_INST_VAVGSW:
+        // Signed rounded average: (a + b + 1) >> 1. Widen first so equal
+        // INT_MAX/INT_MIN inputs cannot overflow before the shift.
+        for (size_t i = 0; i < 4; i++)
+            println("\t{}.s32[{}] = int32_t((int64_t({}.s32[{}]) + int64_t({}.s32[{}]) + 1) >> 1);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
         break;
 
     case PPC_INST_VAVGUB:
@@ -2037,7 +2226,22 @@ bool Recompiler::Recompile(
 
     case PPC_INST_VCMPBFP:
     case PPC_INST_VCMPBFP128:
-        println("\t__builtin_debugtrap();");
+        // Vector Compare Bounds Floating Point: per element, bit 31 is set
+        // when a > b and bit 30 when a < -b; a NaN in either operand sets
+        // both. cmpnle/cmpnge are the NaN-including negations, so each AND
+        // mask is exactly one bound's failure.
+        printSetFlushMode(true);
+        println("\t_mm_store_ps({}.f32, _mm_or_ps(_mm_and_ps(_mm_cmpnle_ps(_mm_load_ps({}.f32), _mm_load_ps({}.f32)), _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000)))), _mm_and_ps(_mm_cmpnge_ps(_mm_load_ps({}.f32), _mm_xor_ps(_mm_load_ps({}.f32), _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000))))), _mm_castsi128_ps(_mm_set1_epi32(0x40000000)))));",
+            v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[1]), v(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+        {
+            // The record form sets only CR6 bit 2: all elements in bounds,
+            // i.e. the whole result is zero (both failure bits clear).
+            println("\t{}.lt = 0;", cr(6));
+            println("\t{}.gt = 0;", cr(6));
+            println("\t{}.eq = _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_load_si128((__m128i*){}.u32), _mm_setzero_si128())) == 0xFFFF;", cr(6), v(insn.operands[0]));
+            println("\t{}.so = 0;", cr(6));
+        }
         break;
 
     case PPC_INST_VCMPEQFP:
@@ -2223,6 +2427,20 @@ bool Recompiler::Recompile(
         println("\t_mm_store_ps({}.f32, _mm_xor_ps(_mm_sub_ps(_mm_mul_ps(_mm_load_ps({}.f32), _mm_load_ps({}.f32)), _mm_load_ps({}.f32)), _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
         break;
 
+    // ~(a | b). With both source registers the same it is the compiler's way of
+    // spelling "bitwise not", which is how it is nearly always used - so that
+    // case skips the redundant or.
+    case PPC_INST_VNOR:
+    case PPC_INST_VNOR128:
+        print("\t_mm_store_si128((__m128i*){}.u8, _mm_xor_si128(", v(insn.operands[0]));
+
+        if (insn.operands[1] != insn.operands[2])
+            println("_mm_or_si128(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8)), _mm_set1_epi32(-1)));", v(insn.operands[1]), v(insn.operands[2]));
+        else
+            println("_mm_load_si128((__m128i*){}.u8), _mm_set1_epi32(-1)));", v(insn.operands[1]));
+
+        break;
+
     case PPC_INST_VOR:
     case PPC_INST_VOR128:
         print("\t_mm_store_si128((__m128i*){}.u8, ", v(insn.operands[0]));
@@ -2269,6 +2487,62 @@ bool Recompiler::Recompile(
                 println("\t{}.u32 {}= uint32_t({}.u8[{}]) << {};", temp(), i == 0 ? "" : "|", vTemp(), i * 4, indices[i] * 8);
             }
             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+            break;
+
+        case 2: // 2_10_10_10 (VPACK_NORMPACKED32, DXGI_FORMAT_R10G10B10A2)
+            if (insn.operands[3] != 1)
+                fmt::println("Unexpected 2_10_10_10 pack instruction at {:X}", base);
+
+            // The Xenos pack reads the low mantissa bits of floats the game
+            // has pre-biased into a narrow window around 3.0: clamp into the
+            // window, then mask the bits. XYZ are the signed-10-bit
+            // components, W the unsigned-2-bit one (Xenia's
+            // XMMPackUINT_2101010_* constants, x64_emitter.cc). Lanes are
+            // reversed here, so guest x y z w live at .f32[3..0].
+            //
+            // The compares are ordered max-then-min so a NaN source packs as
+            // the window minimum, matching vmaxps/vminps on a NaN operand.
+            for (size_t i = 0; i < 4; i++)
+            {
+                const char* minC = i == 0 ? "3.0f" : "2.999878168106079f";
+                const char* maxC = i == 0 ? "3.0000007152557373f"
+                                          : "3.000121831893921f";
+                println("\t{}.f32[{}] = {}.f32[{}] >= {} ? {}.f32[{}] : {};",
+                        vTemp(), i, v(insn.operands[1]), i, minC,
+                        v(insn.operands[1]), i, minC);
+                println("\t{}.f32[{}] = {}.f32[{}] <= {} ? {}.f32[{}] : {};",
+                        vTemp(), i, vTemp(), i, maxC, vTemp(), i, maxC);
+            }
+            // w<<30 | z<<20 | y<<10 | x, from lanes 0,1,2,3 respectively.
+            println("\t{}.u32 = (({}.u32[0] & 0x3u) << 30) | (({}.u32[1] & 0x3FFu) << 20) | (({}.u32[2] & 0x3FFu) << 10) | ({}.u32[3] & 0x3FFu);",
+                    temp(), vTemp(), vTemp(), vTemp(), vTemp());
+            println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]),
+                    insn.operands[4], temp());
+            break;
+
+        case 3: // float16_2 (VPACK_FLOAT16_2, D3D R16G16_FLOAT)
+            if (insn.operands[3] != 1)
+                fmt::println("Unexpected float16_2 pack instruction at {:X}", base);
+
+            // Packs source x and y (u32[3] and u32[2] in this reversed
+            // layout) to half floats forming ((half)x << 16) | (half)y, and
+            // replaces only destination word [operands[4]] - the same
+            // VPACK_32 placement rule the D3D color case above uses. The two
+            // halves are assembled in vTemp.u32[3] (u8[0] is the per-element
+            // exponent scratch, so word 0 is off limits) and stored once,
+            // which also keeps a source-aliasing destination safe.
+            for (size_t i = 0; i < 2; i++)
+            {
+                const size_t src = 3 - i;   // x then y
+                const size_t out = 7 - i;   // vTemp.u16 high then low of u32[3]
+                // Same conversion as the float16_4 case below.
+                println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), src);
+                println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), src);
+                println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), src);
+                println("\t{0}.u16[{1}] = {0}.u8[0] != 0xFF ? ({0}.u8[0] > 0x70 ? ((({0}.u8[0]-0x70)<<10)+{2}.u16) : (0x71-{0}.u8[0] > 31 ? 0x0 : ((0x400+{2}.u16)>>(0x71-{0}.u8[0])))) : 0x7FFF;", vTemp(), out, temp());
+                println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", vTemp(), out, v(insn.operands[1]), src);
+            }
+            println("\t{}.u32[{}] = {}.u32[3];", v(insn.operands[0]), insn.operands[4], vTemp());
             break;
 
         case 5: // float16_4
@@ -2358,6 +2632,21 @@ bool Recompiler::Recompile(
         println("{} = {};", v(insn.operands[0]), vTemp());
         break;
 
+    // Word -> halfword MODULO, which truncates rather than saturating:
+    // 0x0001FFFF becomes 0xFFFF, where VPKUWUS would clamp. Same operand order
+    // as VPKUHUM one size up - vB fills the low half, vA the high - with the
+    // clamp removed rather than replaced, because the truncation IS the
+    // instruction.
+    case PPC_INST_VPKUWUM:
+    case PPC_INST_VPKUWUM128:
+        for (size_t i = 0; i < 4; i++)
+        {
+            println("\t{0}.u16[{1}] = uint16_t({2}.u32[{1}]);", vTemp(), i, v(insn.operands[2]));
+            println("\t{0}.u16[{1}] = uint16_t({2}.u32[{3}]);", vTemp(), i + 4, v(insn.operands[1]), i);
+        }
+        println("{} = {};", v(insn.operands[0]), vTemp());
+        break;
+
     case PPC_INST_VREFP:
     case PPC_INST_VREFP128:
         // TODO: see if we can use rcp safely
@@ -2375,6 +2664,12 @@ bool Recompiler::Recompile(
     case PPC_INST_VRFIN128:
         printSetFlushMode(true);
         println("\t_mm_store_ps({}.f32, _mm_round_ps(_mm_load_ps({}.f32), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
+        break;
+
+    case PPC_INST_VRFIP:
+    case PPC_INST_VRFIP128:
+        printSetFlushMode(true);
+        println("\t_mm_store_ps({}.f32, _mm_round_ps(_mm_load_ps({}.f32), _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
         break;
 
     case PPC_INST_VRFIZ:
@@ -2426,6 +2721,53 @@ bool Recompiler::Recompile(
     case PPC_INST_VSLDOI:
     case PPC_INST_VSLDOI128:
         println("\t_mm_store_si128((__m128i*){}.u8, _mm_alignr_epi8(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8), {}));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), 16 - insn.operands[3]);
+        break;
+
+    case PPC_INST_VSLO:
+    case PPC_INST_VSLO128:
+        // Shift the WHOLE vector left by whole octets, zero-filling from the
+        // right - not a per-element shift like the VSLB/VSLH/VSLW family above,
+        // so the vector reversal every load performs has to be accounted for.
+        //
+        // The guest count is bits 121:124 of vB, which is bits 1:4 of its
+        // lowest-order byte - `(VB.b[F] & 0x78) >> 3` as Xenia writes it
+        // (ppc_emit_altivec.cc, InstrEmit_vslo_). Guest byte 15 is u8[0] here.
+        //
+        // Guest result byte i is vA byte i+sh; with host index h = 15-i that is
+        // vA host byte h-sh, so it stays a left shift in host element order.
+        // Zero fill happens where h < sh; the index is masked so the untaken
+        // arm of the select can never name a byte outside the register.
+        //
+        // vTemp because the destination is very often also vA, and this reads
+        // lower host indices than it writes.
+        println("\t{}.u32 = ({}.u8[0] >> 3) & 0xF;", temp(), v(insn.operands[2]));
+        for (size_t i = 0; i < 16; i++)
+            println("\t{}.u8[{}] = {} >= {}.u32 ? {}.u8[({} - {}.u32) & 0xF] : 0;", vTemp(), i, i, temp(), v(insn.operands[1]), i, temp());
+        println("\t{} = {};", v(insn.operands[0]), vTemp());
+        break;
+
+    case PPC_INST_VSRO:
+    case PPC_INST_VSRO128:
+        // The mirror of VSLO above: shift the WHOLE vector right by whole
+        // octets, zero-filling from the left. Same reasoning about the vector
+        // reversal every load performs, run the other way.
+        //
+        // The guest count is read identically - bits 121:124 of vB, i.e. bits
+        // 1:4 of its lowest-order byte, which is u8[0] here (Xenia's
+        // InstrEmit_vsro_ in ppc_emit_altivec.cc).
+        //
+        // Guest result byte i is vA byte i-sh; with host index h = 15-i that is
+        // vA host byte h+sh, so it stays a right shift in host element order.
+        // Zero fill happens where h+sh > 15; as with VSLO the index is masked
+        // so the untaken arm of the select can never name a byte outside the
+        // register.
+        //
+        // vTemp because the destination is very often also vA, and this reads
+        // higher host indices than it writes.
+        println("\t{}.u32 = ({}.u8[0] >> 3) & 0xF;", temp(), v(insn.operands[2]));
+        for (size_t i = 0; i < 16; i++)
+            println("\t{}.u8[{}] = {} + {}.u32 <= 15 ? {}.u8[({} + {}.u32) & 0xF] : 0;", vTemp(), i, i, temp(), v(insn.operands[1]), i, temp());
+        println("\t{} = {};", v(insn.operands[0]), vTemp());
         break;
 
     case PPC_INST_VSLW:
@@ -2517,6 +2859,13 @@ bool Recompiler::Recompile(
         println("\t_mm_store_ps({}.f32, _mm_sub_ps(_mm_load_ps({}.f32), _mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
+    case PPC_INST_VSUBSBS:
+        // Signed saturating byte subtract, which is exactly _mm_subs_epi8.
+        // Element-wise, so the whole-vector reversal is irrelevant here - the
+        // same reason VSUBUBS just below can use _mm_subs_epu8 directly.
+        println("\t_mm_store_si128((__m128i*){}.u8, _mm_subs_epi8(_mm_load_si128((__m128i*){}.u8), _mm_load_si128((__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
     case PPC_INST_VSUBSHS:
         // TODO: vectorize
         for (size_t i = 0; i < 8; i++)
@@ -2564,13 +2913,79 @@ bool Recompiler::Recompile(
         case 1: // 2 shorts
             for (size_t i = 0; i < 2; i++)
             {
-                println("\t{}.f32 = 3.0f;", temp());
-                println("\t{}.s32 += {}.s16[{}];", temp(), v(insn.operands[1]), 1 - i);
-                println("\t{}.f32[{}] = {}.f32;", vTemp(), 3 - i, temp());
+                println("\t{}.s32 = {}.s16[{}];", temp(), v(insn.operands[1]), 1 - i);
+                println("\t{}.u32[{}] = {}.s32 == -32768 ? 0x7FC00000 : uint32_t({}.s32 + 0x40400000);", vTemp(), 3 - i, temp(), temp());
             }
             println("\t{}.f32[1] = 0.0f;", vTemp());
             println("\t{}.f32[0] = 1.0f;", vTemp());
             println("\t{} = {};", v(insn.operands[0]), vTemp());
+            break;
+
+        case 2: // packed 2:10:10:10 (signed XYZ, unsigned W)
+            println("\t{}.u32 = {}.u32[0];", temp(), v(insn.operands[1]));
+            for (size_t i = 0; i < 3; i++)
+            {
+                println("\t{}.s32[0] = int32_t({}.u32 << {}) >> 22;", vTemp(), temp(), 22 - i * 10);
+                println("\t{}.u32[{}] = {}.s32[0] == -512 ? 0x7FC00000 : uint32_t({}.s32[0] + 0x40400000);", v(insn.operands[0]), 3 - i, vTemp(), vTemp());
+            }
+            println("\t{}.u32[0] = ({}.u32 >> 30) | 0x3F800000;", v(insn.operands[0]), temp());
+            break;
+
+        // The two half-float unpacks, matching Xenia's InstrEmit_vupkd3d128
+        // types 3 (VPACK_FLOAT16_2) and 5 (VPACK_FLOAT16_4), and exactly
+        // inverting the float16_4 case of VPKD3D128 above.
+        //
+        // The halves are XENOS half-floats, not IEEE binary16: exponent bias
+        // 112 rather than 15, no infinity and no NaN, and denormals read as
+        // zero (Xenia's xenos_half_to_float with preserve_denormal = false,
+        // which is what vupkd3d128 uses). Decoding them as IEEE would be wrong
+        // by a factor of 2^97 on every value that is not zero, which is the
+        // kind of wrong that renders as geometry flung off to infinity rather
+        // than as an obvious failure.
+        //
+        // Element order follows the reversal the rest of this case handles:
+        // the vector is byte-reversed on load, so guest halfword k lives at
+        // .u16[7 - k] and the guest's leftmost float x is .f32[3]. Working
+        // that through, both unpacks read .u16[] and write .f32[] at matching
+        // indices - the same correspondence the pack relies on.
+        case 3: // 2 half floats
+            for (size_t i = 0; i < 2; i++)
+            {
+                println("\t{}.u32 = {}.u16[{}];", temp(), v(insn.operands[1]), 1 - i);
+                println("\t{}.u32[{}] = (({}.u32 & 0x8000) << 16) | ((({}.u32 & 0x7C00) != 0) ? (((((({}.u32 >> 10) & 0x1F) + 112) << 23) | (({}.u32 & 0x3FF) << 13))) : 0);", vTemp(), 3 - i, temp(), temp(), temp(), temp());
+            }
+            // The guest splats these after unpacking to get vectors of 1.0f,
+            // so they are part of the instruction, not padding.
+            println("\t{}.f32[1] = 0.0f;", vTemp());
+            println("\t{}.f32[0] = 1.0f;", vTemp());
+            println("\t{} = {};", v(insn.operands[0]), vTemp());
+            break;
+
+        case 4: // 4 shorts
+            for (size_t i = 0; i < 4; i++)
+            {
+                println("\t{}.s32 = {}.s16[{}];", temp(), v(insn.operands[1]), 3 - i);
+                println("\t{}.u32[{}] = {}.s32 == -32768 ? 0x7FC00000 : uint32_t({}.s32 + 0x40400000);", v(insn.operands[0]), 3 - i, temp(), temp());
+            }
+            break;
+
+        case 5: // 4 half floats
+            for (size_t i = 0; i < 4; i++)
+            {
+                println("\t{}.u32 = {}.u16[{}];", temp(), v(insn.operands[1]), i);
+                println("\t{}.u32[{}] = (({}.u32 & 0x8000) << 16) | ((({}.u32 & 0x7C00) != 0) ? (((((({}.u32 >> 10) & 0x1F) + 112) << 23) | (({}.u32 & 0x3FF) << 13))) : 0);", vTemp(), i, temp(), temp(), temp(), temp());
+            }
+            println("\t{} = {};", v(insn.operands[0]), vTemp());
+            break;
+
+        case 6: // packed 4:20:20:20 (signed XYZ, unsigned W)
+            println("\t{}.u64[0] = {}.u64[0];", vTemp(), v(insn.operands[1]));
+            for (size_t i = 0; i < 3; i++)
+            {
+                println("\t{}.s32 = int32_t(int64_t({}.u64[0] << {}) >> 44);", temp(), vTemp(), 44 - i * 20);
+                println("\t{}.u32[{}] = {}.s32 == -524288 ? 0x7FC00000 : uint32_t({}.s32 + 0x40400000);", v(insn.operands[0]), 3 - i, temp(), temp());
+            }
+            println("\t{}.u32[0] = uint32_t({}.u64[0] >> 60) | 0x3F800000;", v(insn.operands[0]), vTemp());
             break;
 
         default:
@@ -2640,6 +3055,83 @@ bool Recompiler::Recompile(
     if (midAsmHook != config.midAsmHooks.end() && midAsmHook->second.afterInstruction)
         printMidAsmHook();
     
+    return true;
+}
+
+// "Runs off its end" means the function's last instruction neither branches nor
+// returns, so control would continue into whatever follows. That is a real
+// defect when analysis split a shared tail in two - but it is NOT a defect when
+// the last instruction is a call to a routine that never comes back. The
+// compiler emits no return after such a call because none can be reached, and
+// what follows is alignment padding, not the rest of the function.
+//
+// RAINBOW ISLANDS TOWERING ADVENTURE! reports 54 of these and every one is that
+// shape: a final `bl`, a single 0x00000000 padding word, then the next
+// function's `mflr r12`. 42 of them call 82437218 and 5 call longjmp.
+//
+// A routine that never returns is one whose body contains no return
+// instruction, which is a fact about the target that can simply be read. The
+// check is deliberately conservative - an unknown target, or one whose extent
+// is not known, is NOT excused - because the cost of being wrong here is a
+// missing diagnostic on a genuinely truncated function.
+bool Recompiler::EndsInCallThatNeverReturns(const ppc_insn& insn) const
+{
+    if (insn.opcode == nullptr || insn.opcode->id != PPC_INST_BL)
+        return false;
+
+    const uint32_t target = insn.operands[0];
+
+    // longjmp is the unarguable case: it resumes at a setjmp, so it cannot
+    // return to its caller, and it is already emitted as the host longjmp.
+    if (config.longJmpAddress != 0 && target == config.longJmpAddress)
+        return true;
+
+    auto symbol = image.symbols.find(target);
+    if (symbol == image.symbols.end() || symbol->address != target ||
+        symbol->type != Symbol_Function || symbol->size < 4)
+    {
+        return false;
+    }
+
+    // An IMPORT cannot be judged by reading its body. The XEX loader replaces
+    // every import thunk in the image with `nop nop nop blr` and does the real
+    // work in the named __imp__ host function, so scanning the thunk finds a
+    // return for every import there has ever been - including the ones that
+    // terminate the thread.
+    //
+    // So imports are judged by name, and only where the name settles it. This
+    // list is deliberately tiny: an export that merely USUALLY does not return
+    // does not belong on it. RtlRaiseException is the obvious omission - an
+    // exception handler may resume execution, so it can come back.
+    static const char* const kNeverReturns[] = {
+        "__imp__ExTerminateThread",
+        "__imp__KeBugCheck",
+        "__imp__KeBugCheckEx",
+        "__imp__HalReturnToFirmware",
+    };
+    for (const char* name : kNeverReturns)
+    {
+        if (symbol->name == name)
+            return true;
+    }
+    if (symbol->name.rfind("__imp__", 0) == 0)
+        return false;
+
+    const auto* code = (const uint32_t*)image.Find(target);
+    if (code == nullptr)
+        return false;
+
+    // Any member of the branch-to-link-register family returns, including the
+    // conditional ones (`beqlr` and friends), so scanning for the unconditional
+    // `blr` encoding alone would call a routine no-return because its only exit
+    // happens to be conditional.
+    for (size_t offset = 0; offset < symbol->size; offset += 4)
+    {
+        const uint32_t instruction = ByteSwap(code[offset / 4]);
+        if (PPC_OP(instruction) == 19 && ((instruction >> 1) & 0x3FF) == 16)
+            return false;
+    }
+
     return true;
 }
 
@@ -2759,7 +3251,9 @@ bool Recompiler::Recompile(const Function& fn)
     tempString.clear();
     std::swap(out, tempString);
 
-    ppc_insn insn;
+    // Zero-initialised because the "runs off its end" check below reads it, and
+    // a function with no instructions never enters the loop that writes it.
+    ppc_insn insn{};
     while (base < end)
     {
         if (labels.find(base) != labels.end())
@@ -2799,10 +3293,31 @@ bool Recompiler::Recompile(const Function& fn)
         ++data;
     }
 
-#if 0
+    // A function whose last instruction is not an unconditional branch or a
+    // return does not end there - it runs straight on into whatever follows.
+    //
+    // That happens whenever the compiler gave several functions one shared
+    // tail and analysis split them apart: the earlier half has no branch of
+    // its own because it simply fell into the later half. Emitting nothing
+    // here drops the rest of the computation silently - the function returns
+    // with its result registers never written, which at runtime looks like a
+    // feature that does nothing rather than like a bug. Tail-calling the code
+    // that follows is what the hardware would have done.
     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
-        fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
-#endif
+    {
+        auto nextSymbol = image.symbols.find(base);
+        if (nextSymbol != image.symbols.end() && nextSymbol->address == base &&
+            nextSymbol->type == Symbol_Function)
+        {
+            println("\t// fallthrough to {:X}", base);
+            println("\t{}(ctx, base);", nextSymbol->name);
+            println("\treturn;");
+        }
+        else if (!EndsInCallThatNeverReturns(insn))
+        {
+            fmt::println("Function at {:X} runs off its end at {:X} with nothing following it", fn.base, base);
+        }
+    }
 
     println("}}\n");
 

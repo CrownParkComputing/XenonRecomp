@@ -20,6 +20,8 @@ set(XENONRECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XenonRecomp)
 
 project ("XenonRecomp-ALL")
 
+include(CTest)
+
 add_subdirectory(${XENONANALYSE_ROOT})
 add_subdirectory(${XENONRECOMP_ROOT})
 add_subdirectory(${XENONUTILS_ROOT})

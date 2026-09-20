@@ -18,3 +18,17 @@ if(TEST_FILES)
             "-Wno-unused-variable"
     )
 endif()
+
+find_package(Python3 COMPONENTS Interpreter)
+if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    add_test(
+        NAME xenon_dcbz_codegen_contract
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_dcbz_codegen.py
+                ${XENONRECOMP_ROOT}/recompiler.cpp)
+    add_test(
+        NAME xenon_rotate_record_codegen_contract
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_rotate_record_codegen.py
+                ${XENONRECOMP_ROOT}/recompiler.cpp)
+endif()

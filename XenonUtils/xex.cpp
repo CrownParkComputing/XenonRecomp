@@ -1,4 +1,5 @@
 #include "xex.h"
+
 #include "image.h"
 #include <cassert>
 #include <cstring>
@@ -132,129 +133,182 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
 
     Image image{};
     std::unique_ptr<uint8_t[]> result{};
-    size_t imageSize = security->imageSize;
+    const size_t imageSize = security->imageSize;
 
     // Decompress image
     if (fileFormatInfo != nullptr)
     {
         assert(fileFormatInfo->compressionType <= XEX_COMPRESSION_NORMAL);
 
-        std::unique_ptr<uint8_t[]> decryptedData;
-        const uint8_t* srcData = nullptr;
+        // The image body is encrypted under a session key that is itself
+        // wrapped with the console key. Retail titles wrap it with the retail
+        // console key; devkit-signed titles (After Burner Climax, for example)
+        // wrap it with the all-zero devkit key - the same is_dev_kit_ choice
+        // ReXGlue makes. Try both and accept whichever produces a PE image: a
+        // correctly decoded image starts with the DOS 'MZ' signature.
+        const int keyCount =
+            fileFormatInfo->encryptionType == XEX_ENCRYPTION_NORMAL ? 2 : 1;
+        const uint8_t* consoleKeys[] = { Xex2RetailKey, Xex2DevkitKey };
 
-        if (fileFormatInfo->encryptionType == XEX_ENCRYPTION_NORMAL)
+        bool accepted = false;
+
+        for (int attempt = 0; attempt < keyCount; attempt++)
         {
-            constexpr uint32_t KeySize = 16;
-            AES_ctx aesContext;
+            const uint8_t* consoleKey = consoleKeys[attempt];
 
-            uint8_t decryptedKey[KeySize];
-            memcpy(decryptedKey, security->aesKey, KeySize);
-            AES_init_ctx_iv(&aesContext, Xex2RetailKey, AESBlankIV);
-            AES_CBC_decrypt_buffer(&aesContext, decryptedKey, KeySize);
+            std::unique_ptr<uint8_t[]> decryptedData;
+            const uint8_t* srcData = nullptr;
 
-            decryptedData = std::make_unique<uint8_t[]>(dataSize - header->headerSize);
-            memcpy(decryptedData.get(), data + header->headerSize, dataSize - header->headerSize);
-            AES_init_ctx_iv(&aesContext, decryptedKey, AESBlankIV);
-            AES_CBC_decrypt_buffer(&aesContext, decryptedData.get(), dataSize - header->headerSize);
-
-            srcData = decryptedData.get();
-        }
-        else
-        {
-            srcData = data + header->headerSize;
-        }
-
-        if (fileFormatInfo->compressionType == XEX_COMPRESSION_NONE)
-        {
-            result = std::make_unique<uint8_t[]>(imageSize);
-            memcpy(result.get(), srcData, imageSize);
-        }
-        else if (fileFormatInfo->compressionType == XEX_COMPRESSION_BASIC)
-        {
-            auto* blocks = reinterpret_cast<const Xex2FileBasicCompressionBlock*>(fileFormatInfo + 1);
-            const size_t numBlocks = (fileFormatInfo->infoSize / sizeof(Xex2FileBasicCompressionInfo)) - 1;
-
-            imageSize = 0;
-            for (size_t i = 0; i < numBlocks; i++)
+            if (fileFormatInfo->encryptionType == XEX_ENCRYPTION_NORMAL)
             {
-                imageSize += blocks[i].dataSize + blocks[i].zeroSize;
+                constexpr uint32_t KeySize = 16;
+                AES_ctx aesContext;
+
+                uint8_t decryptedKey[KeySize];
+                memcpy(decryptedKey, security->aesKey, KeySize);
+                AES_init_ctx_iv(&aesContext, consoleKey, AESBlankIV);
+                AES_CBC_decrypt_buffer(&aesContext, decryptedKey, KeySize);
+
+                decryptedData = std::make_unique<uint8_t[]>(dataSize - header->headerSize);
+                memcpy(decryptedData.get(), data + header->headerSize, dataSize - header->headerSize);
+                AES_init_ctx_iv(&aesContext, decryptedKey, AESBlankIV);
+                AES_CBC_decrypt_buffer(&aesContext, decryptedData.get(), dataSize - header->headerSize);
+
+                srcData = decryptedData.get();
+            }
+            else
+            {
+                srcData = data + header->headerSize;
             }
 
-            result = std::make_unique<uint8_t[]>(imageSize);
-            auto* destData = result.get();
+            result.reset();
 
-            for (size_t i = 0; i < numBlocks; i++)
+            if (fileFormatInfo->compressionType == XEX_COMPRESSION_NONE)
             {
-                memcpy(destData, srcData, blocks[i].dataSize);
-
-                srcData += blocks[i].dataSize;
-                destData += blocks[i].dataSize;
-
-                memset(destData, 0, blocks[i].zeroSize);
-                destData += blocks[i].zeroSize;
+                result = std::make_unique<uint8_t[]>(imageSize);
+                memcpy(result.get(), srcData, imageSize);
             }
-        }
-        else if (fileFormatInfo->compressionType == XEX_COMPRESSION_NORMAL)
-        {
-            result = std::make_unique<uint8_t[]>(imageSize);
-            auto* destData = result.get();
-
-            const Xex2CompressedBlockInfo* blocks = &((const Xex2FileNormalCompressionInfo*)(fileFormatInfo + 1))->firstBlock;
-            const uint32_t headerSize = header->headerSize.get();
-
-            const uint32_t exeLength = dataSize - headerSize;
-            const uint8_t* exeBuffer = srcData;
-
-            auto compressBuffer = std::make_unique<uint8_t[]>(exeLength);
-            const uint8_t* p = NULL;
-            uint8_t* d = NULL;
-            sha1::SHA1 s;
-
-            p = exeBuffer;
-            d = compressBuffer.get();
-
-            uint8_t blockCalcedDigest[0x14];
-            while (blocks->blockSize) 
+            else if (fileFormatInfo->compressionType == XEX_COMPRESSION_BASIC)
             {
-                const uint8_t* pNext = p + blocks->blockSize;
-                const auto* nextBlock = (const Xex2CompressedBlockInfo*)p;
+                auto* blocks = reinterpret_cast<const Xex2FileBasicCompressionBlock*>(fileFormatInfo + 1);
+                const size_t numBlocks = (fileFormatInfo->infoSize / sizeof(Xex2FileBasicCompressionInfo)) - 1;
 
-                s.reset();
-                s.processBytes(p, blocks->blockSize);
-                s.finalize(blockCalcedDigest);
-
-                if (memcmp(blockCalcedDigest, blocks->blockHash, 0x14) != 0)
-                    return {};
-
-                p += 4;
-                p += 20;
-
-                while (true) 
+                size_t basicSize = 0;
+                for (size_t i = 0; i < numBlocks; i++)
                 {
-                    const size_t chunkSize = (p[0] << 8) | p[1];
-                    p += 2;
-
-                    if (!chunkSize)
-                        break;
-
-                    memcpy(d, p, chunkSize);
-                    p += chunkSize;
-                    d += chunkSize;
+                    basicSize += blocks[i].dataSize + blocks[i].zeroSize;
                 }
 
-                p = pNext;
-                blocks = nextBlock;
+                result = std::make_unique<uint8_t[]>(basicSize);
+                auto* destData = result.get();
+
+                for (size_t i = 0; i < numBlocks; i++)
+                {
+                    memcpy(destData, srcData, blocks[i].dataSize);
+
+                    srcData += blocks[i].dataSize;
+                    destData += blocks[i].dataSize;
+
+                    memset(destData, 0, blocks[i].zeroSize);
+                    destData += blocks[i].zeroSize;
+                }
+            }
+            else if (fileFormatInfo->compressionType == XEX_COMPRESSION_NORMAL)
+            {
+                result = std::make_unique<uint8_t[]>(imageSize);
+                auto* destData = result.get();
+
+                const Xex2CompressedBlockInfo* blocks = &((const Xex2FileNormalCompressionInfo*)(fileFormatInfo + 1))->firstBlock;
+                const uint32_t headerSize = header->headerSize.get();
+
+                const uint32_t exeLength = dataSize - headerSize;
+                const uint8_t* exeBuffer = srcData;
+
+                auto compressBuffer = std::make_unique<uint8_t[]>(exeLength);
+                const uint8_t* p = NULL;
+                uint8_t* d = NULL;
+                sha1::SHA1 s;
+
+                p = exeBuffer;
+                d = compressBuffer.get();
+
+                uint8_t blockCalcedDigest[0x14];
+                bool blocksOk = true;
+                while (blocks->blockSize)
+                {
+                    const uint8_t* pNext = p + blocks->blockSize;
+                    const auto* nextBlock = (const Xex2CompressedBlockInfo*)p;
+
+                    s.reset();
+                    s.processBytes(p, blocks->blockSize);
+                    s.finalize(blockCalcedDigest);
+
+                    // A wrong console key turns the block data into noise, so
+                    // the SHA-1 will not match; that signals trying the other
+                    // key rather than a fatal error.
+                    if (memcmp(blockCalcedDigest, blocks->blockHash, 0x14) != 0)
+                    {
+                        blocksOk = false;
+                        break;
+                    }
+
+                    p += 4;
+                    p += 20;
+
+                    while (true)
+                    {
+                        const size_t chunkSize = (p[0] << 8) | p[1];
+                        p += 2;
+
+                        if (!chunkSize)
+                            break;
+
+                        memcpy(d, p, chunkSize);
+                        p += chunkSize;
+                        d += chunkSize;
+                    }
+
+                    p = pNext;
+                    blocks = nextBlock;
+                }
+
+                if (blocksOk)
+                {
+                    int resultCode = 0;
+                    uint32_t uncompressedSize = security->imageSize;
+                    uint8_t* buffer = destData;
+
+                    resultCode = lzxDecompress(compressBuffer.get(), d - compressBuffer.get(), buffer, uncompressedSize, ((const Xex2FileNormalCompressionInfo*)(fileFormatInfo + 1))->windowSize, nullptr, 0);
+
+                    if (resultCode)
+                        result.reset();
+                }
+                else
+                {
+                    result.reset();
+                }
             }
 
-            int resultCode = 0;
-            uint32_t uncompressedSize = security->imageSize;
-            uint8_t* buffer = destData;
-
-            resultCode = lzxDecompress(compressBuffer.get(), d - compressBuffer.get(), buffer, uncompressedSize, ((const Xex2FileNormalCompressionInfo*)(fileFormatInfo + 1))->windowSize, nullptr, 0);
-
-            if (resultCode)
-                return {};
+            // A decoded image is a PE, so it starts with the DOS 'MZ'
+            // signature. Only the correct console key can produce that; an
+            // unencrypted image has no key to get wrong, so it is accepted as
+            // the runtime does (its decode_xex_image skips the MZ check when
+            // encryption is not NORMAL). Either way a null result means the
+            // decompression failed and must not be accepted.
+            if (result &&
+                (fileFormatInfo->encryptionType != XEX_ENCRYPTION_NORMAL ||
+                 (imageSize >= 2 && result[0] == 'M' && result[1] == 'Z')))
+            {
+                accepted = true;
+                break;
+            }
         }
+
+        // Not checking `!result` here: for NONE/BASIC compression a failed
+        // attempt leaves non-null garbage in result, so the acceptance flag is
+        // the only honest test that a key actually worked.
+        if (!accepted)
+            return {};
     }
 
     image.data = std::move(result);
@@ -311,6 +365,10 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
         auto* library = (Xex2ImportLibrary*)(((char*)imports) + sizeof(Xex2ImportHeader) + imports->sizeOfStringTable);
         for (size_t i = 0; i < stringTable.size(); i++)
         {
+            const size_t computedLibrarySize =
+                sizeof(Xex2ImportLibrary) +
+                static_cast<size_t>(library->numberOfImports) * sizeof(Xex2ImportDescriptor);
+            const size_t declaredLibrarySize = library->size;
             auto* descriptors = (Xex2ImportDescriptor*)(library + 1);
             static std::unordered_map<size_t, const char*> DummyExports;
             const std::unordered_map<size_t, const char*>* names = &DummyExports;
@@ -327,13 +385,24 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
             for (size_t im = 0; im < library->numberOfImports; im++)
             {
                 auto originalThunk = (Xex2ThunkData*)image.Find(descriptors[im].firstThunk);
-                auto originalData = originalThunk;
-                originalData->data = ByteSwap(originalData->data);
+                // XEX thunk descriptors are big-endian words:
+                //   bits 31..24 type, 23..16 library hint, 15..0 ordinal.
+                //
+                // Do not decode this through Xex2ThunkData::originalData's
+                // C++ bitfields. Their allocation order is implementation
+                // defined, and mutating the backing word before reading them
+                // made function imports dependent on the host compiler. PGR3
+                // exposed the failure as hundreds of "instructions" such as
+                // 0x0101012E: raw import descriptors left in executable code
+                // instead of being replaced by the callable thunk below.
+                const uint32_t descriptor = ByteSwap(originalThunk->data);
+                const uint8_t type = static_cast<uint8_t>(descriptor >> 24);
+                const uint16_t ordinal = static_cast<uint16_t>(descriptor);
 
-                if (originalData->originalData.type != 0)
+                if (type != 0)
                 {
                     uint32_t thunk[4] = { 0x00000060, 0x00000060, 0x00000060, 0x2000804E };
-                    auto name = names->find(originalData->originalData.ordinal);
+                    auto name = names->find(ordinal);
                     if (name != names->end())
                     {
                         image.symbols.insert({ name->second, descriptors[im].firstThunk, sizeof(thunk), Symbol_Function });
@@ -342,7 +411,19 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
                     memcpy(originalThunk, thunk, sizeof(thunk));
                 }
             }
-            library = (Xex2ImportLibrary*)((char*)(library + 1) + library->numberOfImports * sizeof(Xex2ImportDescriptor));
+
+            // Import-library records may contain more payload than the thunk
+            // descriptor array. Advance by the XEX record's declared size so
+            // that the next library starts at the correct boundary. PGR3's
+            // first record is 0x614 bytes while its descriptor array only
+            // accounts for 0x340 bytes; using the latter skips xboxkrnl.exe
+            // and leaves raw import descriptors in executable code.
+            const size_t librarySize =
+                declaredLibrarySize >= sizeof(Xex2ImportLibrary)
+                    ? declaredLibrarySize
+                    : computedLibrarySize;
+            library = reinterpret_cast<Xex2ImportLibrary*>(
+                reinterpret_cast<char*>(library) + librarySize);
         }
     }
 
